@@ -1,0 +1,143 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # ========== SCA: Trivy ==========
+      - name: Install Trivy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
+      
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      
+      - name: SCA - Generate SBOM
+        run: trivy fs --format cyclonedx --output sbom.json .
+      
+      - name: SCA - Scan vulnerabilities
+        id: sca
+        continue-on-error: true
+        run: |
+          trivy fs --severity CRITICAL,HIGH --format json --output trivy_report.json .
+          CRITICAL_COUNT=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy_report.json)
+          echo "critical_count=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
+          if [ "$CRITICAL_COUNT" -gt 0 ]; then
+            echo "SCA FAILED: CRITICAL vulnerabilities found: $CRITICAL_COUNT"
+            jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") | "  \(.VulnerabilityID) | \(.PkgName) \(.InstalledVersion) -> fixed in \(.FixedVersion)"' trivy_report.json
+            exit 1
+          fi
+          echo "SCA PASSED: No CRITICAL vulnerabilities"
+          exit 0
+      
+      - name: SCA - Check banned components
+        id: banned
+        continue-on-error: true
+        run: |
+          BANNED=0
+          if jq -e '.Results[].Packages[]? | select(.Name=="python-jose" and (.Version | startswith("3.")))' trivy_report.json > /dev/null 2>&1; then
+            VERSION=$(jq -r '.Results[].Packages[]? | select(.Name=="python-jose") | .Version' trivy_report.json)
+            echo "BANNED: python-jose $VERSION (required >=3.4.0)"
+            BANNED=1
+          fi
+          if jq -e '.Results[].Packages[]? | select(.Name=="python-multipart" and (.Version | test("0\\.0\\.1[0-9]")))' trivy_report.json > /dev/null 2>&1; then
+            VERSION=$(jq -r '.Results[].Packages[]? | select(.Name=="python-multipart") | .Version' trivy_report.json)
+            echo "BANNED: python-multipart $VERSION (required >=0.0.22)"
+            BANNED=1
+          fi
+          echo "banned=$BANNED" >> $GITHUB_OUTPUT
+          if [ "$BANNED" -eq 1 ]; then
+            exit 1
+          fi
+          echo "No banned components found"
+          exit 0
+      
+      # ========== SAST: Bandit ==========
+      - name: SAST - Install Bandit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip
+          pip3 install bandit
+      
+      - name: SAST - Run Bandit
+        id: sast
+        continue-on-error: true
+        run: |
+          mkdir -p reports
+          bandit -c bandit.yaml -r . -f json -o reports/bandit-report.json || true
+          echo "SAST scan completed"
+      
+      # ========== Security Gate ==========
+      - name: Security Gate - Process Bandit results
+        id: bandit-gate
+        continue-on-error: true
+        run: |
+          python3 security_gate.py --bandit reports/bandit-report.json --threshold high
+          echo "bandit_exit=$?" >> $GITHUB_OUTPUT
+      
+      # ========== Save artifacts ==========
+      - name: Upload SCA reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-reports
+          path: |
+            sbom.json
+            trivy_report.json
+          retention-days: 7
+      
+      - name: Upload SAST reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-reports
+          path: reports/bandit-report.json
+          retention-days: 7
+      
+      # ========== Final decision ==========
+      - name: Security Gate - FINAL
+        if: steps.sca.outcome == 'failure' || steps.banned.outcome == 'failure' || steps.bandit-gate.outcome == 'failure'
+        run: |
+          echo "=========================================="
+          echo "SECURITY GATE: BLOCKED"
+          echo "=========================================="
+          echo "Reasons:"
+          if [ "${{ steps.sca.outcome }}" = "failure" ]; then
+            echo "  - CRITICAL vulnerabilities found in dependencies"
+          fi
+          if [ "${{ steps.banned.outcome }}" = "failure" ]; then
+            echo "  - Banned components detected"
+          fi
+          if [ "${{ steps.bandit-gate.outcome }}" = "failure" ]; then
+            echo "  - SAST issues found (Bandit)"
+          fi
+          echo ""
+          echo "Actions to fix:"
+          echo "  1. Update python-jose to >=3.4.0"
+          echo "  2. Update python-multipart to >=0.0.22"
+          echo "  3. Fix Bandit findings"
+          exit 1
+      
+      - name: Security Gate - PASS
+        if: steps.sca.outcome == 'success' && steps.banned.outcome == 'success' && steps.bandit-gate.outcome == 'success'
+        run: |
+          echo "=========================================="
+          echo "SECURITY GATE: PASSED"
+          echo "=========================================="
+          echo "SCA: No CRITICAL vulnerabilities"
+          echo "SCA: No banned components"
+          echo "SAST: No HIGH issues"
